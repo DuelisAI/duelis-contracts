@@ -243,6 +243,7 @@ contract DuelHook is BaseHook, IUnlockCallback {
     error TooSoon();
     error OutOfOrder();
     error Nothing();
+    error PartialFill(uint256 expected, uint256 actual);
 
     constructor(
         IPoolManager pm,
@@ -383,6 +384,11 @@ contract DuelHook is BaseHook, IUnlockCallback {
         _side(buy, p.amountSpecified < 0, amt, hookData);
         if (!ethSpecified) return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
         uint256 fee = _take(buy, amt, rate, p.amountSpecified > 0);
+        // the pool must move exactly this much ETH, or afterSwap reverts: no partial fill pays a full fill's fees
+        uint256 expect = p.amountSpecified < 0 ? amt - fee : amt + fee;
+        assembly ("memory-safe") {
+            tstore(0xD0E2, expect)
+        }
         return (this.beforeSwap.selector, toBeforeSwapDelta(int128(int256(fee)), 0), 0);
     }
 
@@ -392,13 +398,21 @@ contract DuelHook is BaseHook, IUnlockCallback {
         onlyPoolManager
         returns (bytes4, int128)
     {
-        if (sender == address(this) || (p.amountSpecified < 0) == p.zeroForOne) return (this.afterSwap.selector, 0);
+        if (sender == address(this)) return (this.afterSwap.selector, 0);
         uint256 rate;
+        uint256 expect;
         assembly ("memory-safe") {
             rate := tload(0xD0E1)
+            expect := tload(0xD0E2)
         }
         int128 e0 = d.amount0();
         uint256 eth = e0 < 0 ? uint256(int256(-e0)) : uint256(int256(e0));
+        if (eth == 0 || d.amount1() == 0) revert Nothing(); // no trade
+        if ((p.amountSpecified < 0) == p.zeroForOne) {
+            // ETH was named: the fees were taken before the swap on the full amount, so only a full fill may stand
+            if (eth != expect) revert PartialFill(expect, eth);
+            return (this.afterSwap.selector, 0);
+        }
         return (this.afterSwap.selector, int128(int256(_take(p.zeroForOne, eth, rate, p.amountSpecified > 0))));
     }
 
@@ -891,7 +905,8 @@ contract DuelHook is BaseHook, IUnlockCallback {
     function buyback() external {
         if (block.timestamp < lastBuyback + BUYBACK_GAP) revert TooSoon();
         (uint160 sp, int24 spot,,) = poolManager.getSlot0(poolId);
-        uint256 spend = (burnBook * PIPS) / (PIPS + PLATFORM_FEE); // leaves room for the platform fee on it
+        uint256 spend = (burnBook * (PIPS - PLATFORM_FEE)) / PIPS; // gross (spend + its fee) stays within the book
+        spend = spend > 2 ? spend - 2 : 0; // the fee rounds up: two wei of room
         uint256 cap = _depth(sp) / 100;
         if (spend > cap) spend = cap;
         if (spend == 0) revert Nothing();
@@ -923,8 +938,14 @@ contract DuelHook is BaseHook, IUnlockCallback {
             BalanceDelta dd = poolManager.swap(poolKey(), SwapParams(true, -int256(spend), limit), "");
             uint256 spent = uint256(-int256(dd.amount0()));
             poolManager.burn(address(this), ETH.toId(), spent);
-            // the hook's own swap skips the hook callbacks, so its platform fee is paid here, from the burn book
-            uint256 pf = FullMath.mulDivRoundingUp(spent, PLATFORM_FEE, PIPS);
+            // the hook's own swap skips the hook callbacks, so its platform fee is paid here, from the burn book:
+            // gross = spent + pf with pf = ceil(gross x 0.30%), the fixed point of that equation (two steps reach it)
+            uint256 pf = FullMath.mulDivRoundingUp(spent, PLATFORM_FEE, PIPS - PLATFORM_FEE);
+            for (uint256 i; i < 3; ++i) {
+                uint256 n = FullMath.mulDivRoundingUp(spent + pf, PLATFORM_FEE, PIPS);
+                if (n == pf) break;
+                pf = n;
+            }
             poolManager.transfer(address(feeVault), ETH.toId(), pf);
             _platform(pf);
             spent += pf;

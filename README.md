@@ -26,7 +26,9 @@ Programmable's Custom Launch (https://programmable.market).
 - Programmable platform fee: 0.30% of every swap's gross native value, enforced by the hook on every buy and sell,
   the launch's first buy and the hook's own buybacks included: ceil(gross x 0.30%) per trade, allocated first, the
   same accounting as Programmable's EthereumNative30HookV3. It accrues to `feeVault` and is paid only to
-  `0xD88539d3c4C460136a733A3Fd60cf6BF269079da`.
+  `0xD88539d3c4C460136a733A3Fd60cf6BF269079da`. A swap that names its ETH amount must fill completely (a
+  partial fill reverts, as in the canonical kernel), and a swap that moves no ETH is refused. On a buyback the fee
+  is ceil(gross x 0.30%) with gross = the ETH swapped + the fee itself.
 - Hook fee split: 55% holders, 20% the winning corner, 20% buyback and burn, 5% keepers.
 - The pool's own LP fee: 1%, paid to the owner through the locker. The liquidity itself is locked forever.
 - In total every trade pays: the hook fee (1%, up to 5% for bot-like trades) + the pool fee (1%) + the platform fee
