@@ -12,7 +12,8 @@ Programmable's Custom Launch (https://programmable.market).
 |---|---|
 | `src/DUEL.sol` | The token. 1,000,000,000 DUEL minted once to the seeder. Token age and ETH dividends that vest by age. No owner function, no further mint, no pause, no tax in the token. |
 | `src/DuelHook.sol` | The hook (permission flags `0x10CC`). The fee, the Guards and Shadows, the daily duel, the purse. No owner function, no upgrade. |
-| `src/DuelSeeder.sol` | The launch initializer. In the launch transaction it names the hook in the token, opens the ETH/DUEL pool at about 1 ETH FDV, puts the whole supply in as one position and mints the LP NFT to the owner. Callable once. |
+| `src/DuelSeeder.sol` | The launch initializer. In the launch transaction it names the hook in the token, opens the ETH/DUEL pool at about 1 ETH FDV, puts the whole supply in as one position, mints the LP NFT straight to the locker, then makes the first buy (0.05 ETH, at least 40,000,000 DUEL, to the owner). Callable once. |
+| `src/DuelLocker.sol` | Permanent custody of the LP NFT. Its only function, `collect(tokenId)`, removes zero liquidity and sends the LP fees to the owner. No withdrawal, no NFT transfer or approval, no arbitrary call, no owner function. |
 | `src/AgentNet.sol`, `src/base/BaseHook.sol` | The small int8 networks; the hook base. |
 | `lib/` | Exact Uniswap v4-core and v4-periphery sources the build uses, unmodified. |
 
@@ -21,10 +22,13 @@ Programmable's Custom Launch (https://programmable.market).
 - Buys, and sells of tokens held 6 hours or more: 1%.
 - Bot-like trades (sells of tokens under 6 hours old, same-block repeats, sandwich back-runs): the champion Guard sets
   1% to 5%. A same-block back-run pays at least its own price gain plus 1%, up to 5%.
-- Platform share: `PLATFORM_FEE` is set at deployment, 0 or 0.3%, paid to Programmable's fee address
-  (`0xD88539d3c4C460136a733A3Fd60cf6BF269079da`) by anyone calling `payPlatform()`.
+- Programmable platform fee: 0.30% of each trade routed by Programmable, collected once by Programmable's router
+  (to `0xD88539d3c4C460136a733A3Fd60cf6BF269079da`). The hook is deployed with `PLATFORM_FEE = 0`, so it adds no
+  second platform charge.
 - Hook fee split: 55% holders, 20% the winning corner, 20% buyback and burn, 5% keepers.
-- The pool's own LP fee (1%) goes to the LP NFT, held by the owner, who can remove the liquidity.
+- The pool's own LP fee: 1%, paid to the owner through the locker. The liquidity itself is locked forever.
+- In total a routed trade pays: the hook fee (1%, up to 5% for bot-like trades) + the pool fee (1%) + the platform
+  fee (0.30%).
 
 Stated plainly: with the 5% ceiling, a large enough sandwich can still profit. Measured on a pool about 6 ETH deep,
 sandwiches around buys of 0.02 to 0.2 ETH lost money and those around buys of 0.5 ETH or more made money; the
