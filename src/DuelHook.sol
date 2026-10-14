@@ -39,10 +39,14 @@ pragma solidity 0.8.26;
 //         profit against the champion, else the Shadows.
 //
 //  RULES . THE PLATFORM
-//      Launched through Programmable (programmable.market). If PLATFORM_FEE is set (3,000 ppm = 0.3%),
-//      every swap also pays that share of its ETH side, assessed on the same gross ETH as the hook
-//      fee, rounded down, held as ETH claims in platformBook, and paid by anyone calling payPlatform()
-//      to PLATFORM, a fixed address. It is not part of the split below.
+//      Launched through Programmable (programmable.market). Every swap of this pool pays PLATFORM_FEE
+//      (3,000 ppm = 0.30%) of its gross native value to Programmable, enforced here, once: the same
+//      accounting as Programmable's EthereumNative30HookV3 (gross native value including the hook fees,
+//      rounded UP per trade, platform allocated first). It is minted as ETH claims to feeVault, an
+//      unmodified EthereumNativeFeeVaultV3 this hook deploys in its constructor, and recorded there;
+//      anyone may call feeVault.claimPlatform(), which pays only 0xD885...79da. The hook's own buyback
+//      swaps, which Uniswap never routes through hook callbacks, pay it too. It is not part of the
+//      split below.
 //
 //  RULES . THE PURSE
 //      The hook fee is split: 55% to holders (sent to the token, which vests it by token age), 20% to
@@ -79,6 +83,7 @@ import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "v4-core/src/libraries/FullMath.sol";
+import {EthereumNativeFeeVaultV3} from "./EthereumNativeFeeVaultV3.sol";
 
 interface IDUEL {
     function totalSupply() external view returns (uint256);
@@ -129,7 +134,8 @@ contract DuelHook is BaseHook, IUnlockCallback {
     IDUEL public immutable TOKEN;
     address public immutable OWNER;
     address public immutable SEEDER; // the only address that may open the pool
-    uint256 public immutable PLATFORM_FEE; // ppm of each swap's ETH side to PLATFORM: 0 or 3,000
+    uint256 public constant PLATFORM_FEE = 3_000; // ppm of each swap's gross native value to PLATFORM
+    EthereumNativeFeeVaultV3 public immutable feeVault; // holds and pays the platform fee, to PLATFORM only
     uint24 public immutable LP_FEE;
     int24 public immutable SPACING;
 
@@ -210,8 +216,7 @@ contract DuelHook is BaseHook, IUnlockCallback {
     uint256 public lastBuyback;
     uint256 public feesAll;
     uint256 public burned;
-    uint256 public platformBook; // owed to PLATFORM
-    uint256 public platformAll;
+    uint256 public platformAll; // platform fee accrued to feeVault, all time
 
     // the side game
     mapping(uint256 => uint256[3]) public sideTotal; // [epoch][1 Guards, 2 Shadows]
@@ -229,7 +234,6 @@ contract DuelHook is BaseHook, IUnlockCallback {
     event SideClaimed(uint256 indexed epoch, address indexed who, uint256 eth);
     event BoughtBack(uint256 eth, uint256 duel);
     event Flushed(uint256 eth);
-    event PlatformPaid(uint256 eth);
 
     error BadWiring();
     error WrongPool();
@@ -251,11 +255,11 @@ contract DuelHook is BaseHook, IUnlockCallback {
     ) BaseHook(pm) {
         if (owner == address(0) || address(token) == address(0) || seeder == address(0)) revert BadWiring();
         if (lpFee > 1_000_000 || (lpFee & 0x800000) != 0 || spacing < 1 || spacing > 16_383) revert BadWiring();
-        if (platformFee != 0 && platformFee != 3_000) revert BadWiring();
+        if (platformFee != PLATFORM_FEE) revert BadWiring();
         TOKEN = token;
         OWNER = owner;
         SEEDER = seeder;
-        PLATFORM_FEE = platformFee;
+        feeVault = new EthereumNativeFeeVaultV3(pm, owner);
         LP_FEE = lpFee;
         SPACING = spacing;
         // the starting corners: Guard 0 is the hand-designed seed; the others are mutations of it.
@@ -378,7 +382,7 @@ contract DuelHook is BaseHook, IUnlockCallback {
         }
         _side(buy, p.amountSpecified < 0, amt, hookData);
         if (!ethSpecified) return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
-        uint256 fee = _take(buy, amt, rate);
+        uint256 fee = _take(buy, amt, rate, p.amountSpecified > 0);
         return (this.beforeSwap.selector, toBeforeSwapDelta(int128(int256(fee)), 0), 0);
     }
 
@@ -395,25 +399,32 @@ contract DuelHook is BaseHook, IUnlockCallback {
         }
         int128 e0 = d.amount0();
         uint256 eth = e0 < 0 ? uint256(int256(-e0)) : uint256(int256(e0));
-        return (this.afterSwap.selector, int128(int256(_take(p.zeroForOne, eth, rate))));
+        return (this.afterSwap.selector, int128(int256(_take(p.zeroForOne, eth, rate, p.amountSpecified > 0))));
     }
 
-    /// @dev The hook fee at `rate` and the platform share on the same gross ETH, both floored, kept as ETH claims.
-    ///      Returns the total taken from the swap.
-    function _take(bool buy, uint256 eth, uint256 rate) internal returns (uint256 total) {
-        uint256 fee = (eth * rate) / PIPS;
-        uint256 pf = (eth * PLATFORM_FEE) / PIPS;
+    /// @dev The hook fee at `rate` and the platform fee on the same gross native value, as Programmable's kernel
+    ///      assesses it: `eth` is gross (exact input) or net of all fees (`net`, exact output, grossed up, rounded
+    ///      up); the platform fee is ceil(gross x 0.30%), allocated first. Returns the total taken from the swap.
+    function _take(bool buy, uint256 eth, uint256 rate, bool net) internal returns (uint256 total) {
+        uint256 gross = net ? FullMath.mulDivRoundingUp(eth, PIPS, PIPS - rate - PLATFORM_FEE) : eth;
+        uint256 pf = FullMath.mulDivRoundingUp(gross, PLATFORM_FEE, PIPS);
+        uint256 fee = net ? gross - eth - pf : (gross * rate) / PIPS;
         total = fee + pf;
-        if (total == 0) return 0;
         if (fee != 0) {
             _book(fee);
-            emit Fee(tx.origin, buy, eth, rate, fee);
+            poolManager.mint(address(this), ETH.toId(), fee);
+            emit Fee(tx.origin, buy, gross, rate, fee);
         }
         if (pf != 0) {
-            platformBook += pf;
-            platformAll += pf;
+            poolManager.mint(address(feeVault), ETH.toId(), pf);
+            _platform(pf);
         }
-        poolManager.mint(address(this), ETH.toId(), total);
+    }
+
+    /// @dev Records `pf` wei of platform fee already held by feeVault as ETH claims.
+    function _platform(uint256 pf) internal {
+        platformAll += pf;
+        feeVault.recordFees(pf, 0);
     }
 
     /// @notice The fee a trade would pay now, without recording it: for the site and for keepers.
@@ -866,15 +877,6 @@ contract DuelHook is BaseHook, IUnlockCallback {
 
     // ═══════════════════════════════════════════════════════════════ money out
 
-    /// @notice Pay the platform share to PLATFORM. Anyone may call; it only ever pays that one address.
-    function payPlatform() external {
-        uint256 amt = platformBook;
-        if (amt == 0) revert Nothing();
-        platformBook = 0;
-        poolManager.unlock(abi.encode(PAY, abi.encode(PLATFORM, amt)));
-        emit PlatformPaid(amt);
-    }
-
     /// @notice Send the holders' book to the token, where it accrues per token and vests by age. Anyone may call.
     function flush() external {
         uint256 amt = holderBook;
@@ -889,7 +891,7 @@ contract DuelHook is BaseHook, IUnlockCallback {
     function buyback() external {
         if (block.timestamp < lastBuyback + BUYBACK_GAP) revert TooSoon();
         (uint160 sp, int24 spot,,) = poolManager.getSlot0(poolId);
-        uint256 spend = burnBook;
+        uint256 spend = (burnBook * PIPS) / (PIPS + PLATFORM_FEE); // leaves room for the platform fee on it
         uint256 cap = _depth(sp) / 100;
         if (spend > cap) spend = cap;
         if (spend == 0) revert Nothing();
@@ -921,6 +923,11 @@ contract DuelHook is BaseHook, IUnlockCallback {
             BalanceDelta dd = poolManager.swap(poolKey(), SwapParams(true, -int256(spend), limit), "");
             uint256 spent = uint256(-int256(dd.amount0()));
             poolManager.burn(address(this), ETH.toId(), spent);
+            // the hook's own swap skips the hook callbacks, so its platform fee is paid here, from the burn book
+            uint256 pf = FullMath.mulDivRoundingUp(spent, PLATFORM_FEE, PIPS);
+            poolManager.transfer(address(feeVault), ETH.toId(), pf);
+            _platform(pf);
+            spent += pf;
             uint256 got = uint256(int256(dd.amount1()));
             poolManager.take(Currency.wrap(address(TOKEN)), address(this), got);
             TOKEN.burn(got);
