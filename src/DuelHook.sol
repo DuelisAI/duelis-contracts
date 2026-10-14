@@ -135,7 +135,7 @@ contract DuelHook is BaseHook, IUnlockCallback {
     address public immutable OWNER;
     address public immutable SEEDER; // the only address that may open the pool
     uint256 public constant PLATFORM_FEE = 3_000; // ppm of each swap's gross native value to PLATFORM
-    EthereumNativeFeeVaultV3 public immutable feeVault; // holds and pays the platform fee, to PLATFORM only
+    EthereumNativeFeeVaultV3 public feeVault; // holds and pays the platform fee, to PLATFORM only; set once, in the constructor
     uint24 public immutable LP_FEE;
     int24 public immutable SPACING;
 
